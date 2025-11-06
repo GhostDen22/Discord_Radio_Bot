@@ -226,11 +226,7 @@ client.on('messageCreate', async (message) => {
 
   const text = message.content.trim();
   const [cmd, ...rest] = text.split(/\s+/);
-  // !help
-  if (cmd === '!help') {
-      return message.channel.send('Команды: !play <url|name>, !stations, !add "<name>" <url>, !list, !stop');
-  }
-
+  
   // !play <url|name>
   if (cmd === '!play') {
     const arg = rest.join(' ').trim();
@@ -276,7 +272,16 @@ client.on('messageCreate', async (message) => {
       return message.channel.send('🛑 Остановлено.');
     }
     return message.channel.send('ℹ️ Бот не в голосовом.');
-  }
+    }
+
+    // !help — помощь
+    if (cmd === '!help') {
+        message.channel.send('Команды: !play <url|name>, !stations, !add "<name>" <url>, !list, !stop');
+        message.channel.send('Пример добавления станции: !add "Моя Радио" http://myradio.example/stream');
+        message.channel.send('Используйте !stations для выбора из меню или !play <name> для быстрого запуска.');
+        message.channel.send('Чтобы остановить бота, используйте команду !stop.');
+        message.channel.send('Если у вас возникли вопросы, обратитесь к администратору сервера.');
+    }
 });
 
 // Обработка выбора из меню
