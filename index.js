@@ -276,11 +276,12 @@ client.on('messageCreate', async (message) => {
 
     // !help — помощь
     if (cmd === '!help') {
-        message.channel.send('Команды: !play <url|name>, !stations, !add "<name>" <url>, !list, !stop');
-        message.channel.send('Пример добавления станции: !add "Моя Радио" http://myradio.example/stream');
-        message.channel.send('Используйте !stations для выбора из меню или !play <name> для быстрого запуска.');
-        message.channel.send('Чтобы остановить бота, используйте команду !stop.');
-        message.channel.send('Если у вас возникли вопросы, обратитесь к администратору сервера.');
+        message.channel.send('!play <url|name> - Запустить радиостанцию по URL или имени из списка.\n' +
+            '!stations - Показать меню выбора радиостанций.\n' +
+            '!add "<name>" <url> - Добавить пользовательскую радиостанцию на время работы бота.\n' +
+            '!list - Вывести список доступных радиостанций с их именами и URL.\n' +
+            '!stop - Остановить воспроизведение и отключить бота от голосового канала.\n' +
+            'Если у вас возникли вопросы, обратитесь к администратору сервера.');
     }
 });
 
