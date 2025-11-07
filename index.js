@@ -23,10 +23,21 @@ const {
   demuxProbe,
 } = require('@discordjs/voice');
 
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const ffmpegStatic = require('ffmpeg-static');
-// системный ffmpeg, если задан FFMPEG_BIN=ffmpeg (Railway), иначе — ffmpeg-static
-const ffmpegBin = process.env.FFMPEG_BIN || ffmpegStatic;
+
+// Автодетект: сначала пробуем системный ffmpeg, если его нет — берём ffmpeg-static.
+function resolveFfmpegBin() {
+  const wanted = process.env.FFMPEG_BIN || 'ffmpeg';
+  try {
+    const ok = spawnSync(wanted, ['-version'], { stdio: 'ignore' });
+    if (ok.status === 0) return wanted;
+  } catch {}
+  if (ffmpegStatic) return ffmpegStatic;
+  throw new Error('FFmpeg not available: neither system ffmpeg nor ffmpeg-static');
+}
+const FFMPEG_BIN = resolveFfmpegBin();
+console.log('🎬 Using FFmpeg:', FFMPEG_BIN);
 
 // ─────────────────────────────────────────────────────────
 // БАЗОВЫЕ ПРОВЕРКИ
@@ -65,31 +76,20 @@ function makeFfmpeg(url) {
 
   const args = [
     '-hide_banner',
-
-    // переподключения
     '-reconnect', '1',
     '-reconnect_streamed', '1',
     '-reconnect_delay_max', '10',
     '-rw_timeout', '15000000',
-
-    // заголовки
     '-headers', headers,
-
-    // анализ/лог
     '-nostdin',
     '-loglevel', 'warning',
     '-analyzeduration', '2000000',
     '-probesize', '256k',
-
-    // вход
     ...(isHls ? ['-protocol_whitelist', 'file,crypto,tcp,http,https,tls'] : []),
     '-i', url,
-
-    // устойчивость
     '-fflags', '+genpts+discardcorrupt',
     '-vn',
-
-    // ВЫВОД: Ogg/Opus (готово для Discord без доп. энкодера)
+    // Выходим уже в Ogg/Opus → Discordу не нужен свой FFmpeg
     '-c:a', 'libopus',
     '-b:a', '128k',
     '-frame_duration', '60',
@@ -98,23 +98,20 @@ function makeFfmpeg(url) {
     'pipe:1',
   ];
 
-  if (!ffmpegBin) throw new Error('FFmpeg binary not found');
+  const proc = spawn(FFMPEG_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
-  const proc = spawn(ffmpegBin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-
-  proc.stderr.on('data', (b) => {
+  proc.stderr.on('data', b => {
     const s = b.toString();
     if (/error|invalid|fail|timeout|403|404|denied|not found/i.test(s)) {
       console.warn('ffmpeg:', s.trim());
     }
   });
-
-  proc.stdout.on('error', (e) => console.error('ffmpeg stdout error:', e));
   proc.on('error', (e) => console.error('ffmpeg spawn error:', e));
   proc.on('close', (code, sig) => console.warn(`ffmpeg closed: code=${code} sig=${sig || ''}`));
 
   return proc;
 }
+
 
 
 // ─────────────────────────────────────────────────────────
