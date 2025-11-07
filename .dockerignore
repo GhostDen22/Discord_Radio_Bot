@@ -1,5 +1,4 @@
 node_modules
-npm-debug.log
 .git
-Dockerfile
-.dockerignore
+.env
+.DS_Store
