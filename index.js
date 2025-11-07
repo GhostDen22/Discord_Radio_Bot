@@ -2,13 +2,23 @@
 require('dotenv').config();
 
 const {
-  Client, GatewayIntentBits,
-  EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder,
+  Client,
+  GatewayIntentBits,
+  EmbedBuilder,
+  ActionRowBuilder,
+  StringSelectMenuBuilder,
 } = require('discord.js');
 
 const {
-  joinVoiceChannel, createAudioPlayer, createAudioResource, getVoiceConnection,
-  AudioPlayerStatus, VoiceConnectionStatus, entersState, StreamType,
+  joinVoiceChannel,
+  createAudioPlayer,
+  createAudioResource,
+  getVoiceConnection,
+  AudioPlayerStatus,
+  VoiceConnectionStatus,
+  NoSubscriberBehavior,
+  entersState,
+  StreamType,
   generateDependencyReport,
 } = require('@discordjs/voice');
 
@@ -27,40 +37,56 @@ console.log('🧩 Voice deps report:\n' + generateDependencyReport());
 console.log('🎬 FFmpeg path:', ffmpeg);
 
 // ─────────────────────────────────────────────────────────
-// КАТАЛОГ СТАНЦИЙ (можешь смело редактировать/добавлять)
-// value = прямой URL потока
+// КАТАЛОГ СТАНЦИЙ
 // ─────────────────────────────────────────────────────────
 const STATIONS = [
   { label: 'Radio R', desc: 'Литва', value: 'https://stream1.relaxfm.lt/rrb128.mp3', emoji: '📻' },
-  { label: 'Авторадио (Мск)', desc: 'HLS',   value: 'https://hls-01-gpm.hostingradio.ru/avtoradio495/playlist.m3u8', emoji: '🚗' },
-  { label: 'Ретро FM (Мск)',  desc: 'MP3',   value: 'http://emgregion.hostingradio.ru:8064/moscow.retrofm.mp3', emoji: '🕰️' },
+  { label: 'Авторадио (Мск)', desc: 'HLS', value: 'https://hls-01-gpm.hostingradio.ru/avtoradio495/playlist.m3u8', emoji: '🚗' },
+  { label: 'Ретро FM (Мск)', desc: 'MP3', value: 'http://emgregion.hostingradio.ru:8064/moscow.retrofm.mp3', emoji: '🕰️' },
 ];
 
-// Хранилище на время жизни процесса (динамически добавленные станции)
-const customStations = []; // {label, desc, value, emoji?}
-
-// Управление по серверам: соединение/плеер/процесс ffmpeg
+const customStations = []; // временные станции на время работы
 const sessions = new Map(); // guildId -> {conn, player, proc, url, retry}
 
 // ─────────────────────────────────────────────────────────
-// FFmpeg (поддерживает m3u8/mp3/aac) + заголовки
+// FFmpeg c авто-переподключением/IPv4/заголовками
 // ─────────────────────────────────────────────────────────
 function makeFfmpeg(url) {
   const headers =
-    'User-Agent: Mozilla/5.0 (DiscordRadioBot)\r\n' +
-    'Referer: https://radior.lt/online/\r\n' +
-    'Origin: https://radior.lt\r\n';
+    'User-Agent: Winamp/5.09\r\n' +
+    'Icy-MetaData: 1\r\n' +
+    'Origin: https://discordapp.com\r\n' +
+    'Referer: https://discordapp.com/\r\n';
+
+  // Если это HLS (.m3u8), дадим whitelist с tls; для mp3/aac он не нужен.
+  const isHls = /\.m3u8(\?|$)/i.test(url);
 
   const args = [
     '-hide_banner',
+
+    // Сетевые флаги / переподключения
     '-reconnect', '1',
     '-reconnect_streamed', '1',
-    '-reconnect_delay_max', '5',
-    '-rw_timeout', '10000000',
+    '-reconnect_delay_max', '10',
+    '-rw_timeout', '15000000',   // 15s на операции ввода-вывода
+
+    // Заголовки и «маскировка» под обычный плеер
     '-headers', headers,
+
+    // Анализ потока — даём чуть больше, чтобы HLS не отваливался сразу
+    '-nostdin',
+    '-loglevel', 'warning',
+    '-analyzeduration', '2000000', // ~2s
+    '-probesize', '256k',
+
+    // Вход
+    ...(isHls ? ['-protocol_whitelist', 'file,crypto,tcp,http,https,tls'] : []),
     '-i', url,
+
     '-fflags', '+genpts+discardcorrupt',
     '-vn',
+
+    // Вывод в сыром PCM (Discord сам кодирует в Opus)
     '-acodec', 'pcm_s16le',
     '-f', 's16le',
     '-ar', '48000',
@@ -73,13 +99,14 @@ function makeFfmpeg(url) {
   proc.stderr.on('data', (b) => {
     const s = b.toString();
     if (/error|invalid|fail|timeout|403|404|denied|not found/i.test(s)) {
-      console.error('ffmpeg:', s.trim());
+      console.warn('ffmpeg:', s.trim());
     }
   });
 
-  proc.on('close', (code) => console.warn('ffmpeg exited with code', code));
+  proc.on('close', (code, sig) => console.warn(`ffmpeg closed: code=${code} sig=${sig || ''}`));
   return proc;
 }
+
 
 // ─────────────────────────────────────────────────────────
 // Запуск/перезапуск потока
@@ -103,10 +130,13 @@ async function playOnGuild(messageOrInteraction, url) {
       guildId: guild.id,
       adapterCreator: guild.voiceAdapterCreator,
       selfDeaf: true,
-      // daveEncryption: false, // если нет @snazzah/davey и вылезает ошибка — временно раскомментируй
+      // Если вдруг будут проблемы с DAVE, можно отключить:
+      // daveEncryption: process.env.DISABLE_DAVE === 'true' ? false : undefined,
     });
 
-    const player = createAudioPlayer();
+    const player = createAudioPlayer({
+      behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
+    });
 
     // Автовосстановление голосового соединения
     conn.on(VoiceConnectionStatus.Disconnected, async () => {
@@ -118,7 +148,7 @@ async function playOnGuild(messageOrInteraction, url) {
         ]);
         console.log('🔄 Voice reconnected');
       } catch {
-        conn.destroy();
+        try { conn.destroy(); } catch {}
         sessions.delete(guild.id);
       }
     });
@@ -128,16 +158,22 @@ async function playOnGuild(messageOrInteraction, url) {
     sessions.set(guild.id, s);
 
     player.on('stateChange', (o, n) => {
-      console.log(`🔁 Player: ${o.status} -> ${n.status}`);
+      console.log(`🎧 Player: ${o.status} -> ${n.status}`);
+      // если пошло Playing — сбрасываем счётчик перезапусков
+      if (n.status === AudioPlayerStatus.Playing) s.retry = 0;
     });
 
-    // Автоперезапуск при обрыве
+    // Автоперезапуск при обрыве с экспоненциальной паузой
     player.on(AudioPlayerStatus.Idle, () => {
       if (!s.url) return;
-      if (s.retry >= 5) return; // ограничим циклы
+      if (s.retry >= 10) {
+        console.warn('⛔ Слишком много перезапусков, остановка.');
+        return;
+      }
+      const delay = Math.min(1000 * (2 ** s.retry), 15_000); // до 15с
+      console.warn(`🔁 Поток оборвался. Перезапуск #${s.retry + 1} через ${delay}мс...`);
+      setTimeout(() => startFfmpegIntoPlayer(s, s.url), delay);
       s.retry++;
-      console.warn(`🔁 Поток оборвался. Перезапуск #${s.retry}...`);
-      startFfmpegIntoPlayer(s, s.url);
     });
 
     player.on('error', (err) => {
@@ -169,7 +205,7 @@ function startFfmpegIntoPlayer(session, url) {
   killProc(session.proc);
   const proc = makeFfmpeg(url);
   session.proc = proc;
-  const resource = createAudioResource(proc.stdout, { inputType: StreamType.Raw });
+  const resource = createAudioResource(proc.stdout, { inputType: StreamType.Raw, inlineVolume: true });
   session.player?.play(resource);
 }
 
@@ -182,10 +218,11 @@ function killProc(proc) {
 // UI: Выпадающее меню станций
 // ─────────────────────────────────────────────────────────
 async function sendStationsMenu(channel) {
-  // максимум 25 опций в одном меню
   const options = [...STATIONS, ...customStations].slice(0, 25).map(s => ({
-    label: s.label, description: s.desc?.slice(0, 50) || 'Радио',
-    value: s.value, emoji: s.emoji || '🎵',
+    label: s.label,
+    description: s.desc?.slice(0, 50) || 'Радио',
+    value: s.value,
+    emoji: s.emoji || '🎵',
   }));
 
   const embed = new EmbedBuilder()
@@ -215,6 +252,9 @@ const client = new Client({
   ],
 });
 
+// NB: warning про ready → clientReady (не критично), можно оставить как есть.
+// Для тишины логов можно так:
+// client.once('clientReady', ...) — но оставлю твой стиль:
 client.once('ready', () => {
   console.log(`✅ Запущен как ${client.user.tag}`);
   console.log('Команды: !play <url|name>, !stations, !add "<name>" <url>, !list, !stop');
@@ -226,12 +266,11 @@ client.on('messageCreate', async (message) => {
 
   const text = message.content.trim();
   const [cmd, ...rest] = text.split(/\s+/);
-  // !help
+
   if (cmd === '!help') {
-      return message.channel.send('Команды: !play <url|name>, !stations, !add "<name>" <url>, !list, !stop');
+    return message.channel.send('Команды: !play <url|name>, !stations, !add "<name>" <url>, !list, !stop');
   }
 
-  // !play <url|name>
   if (cmd === '!play') {
     const arg = rest.join(' ').trim();
     if (!arg) return message.reply('Использование: `!play <url|имя_станции>`');
@@ -244,12 +283,10 @@ client.on('messageCreate', async (message) => {
     return playOnGuild(message, url);
   }
 
-  // !stations — показать меню
   if (cmd === '!stations') {
     return sendStationsMenu(message.channel);
   }
 
-  // !add "<name>" <url> — добавить свою станцию на время работы бота
   if (cmd === '!add') {
     const m = text.match(/^!add\s+"([^"]+)"\s+(\S+)/);
     if (!m) {
@@ -260,18 +297,16 @@ client.on('messageCreate', async (message) => {
     return message.reply(`✅ Добавил в список: **${label}** → ${url}`);
   }
 
-  // !list — вывести список имён, чтобы потом было удобно !play <name>
   if (cmd === '!list') {
     const lines = [...STATIONS, ...customStations].map(s => `• **${s.label}** — ${s.value}`);
     return message.reply(lines.join('\n').slice(0, 1900));
   }
 
-  // !stop — остановить и выйти
   if (cmd === '!stop') {
     const s = sessions.get(message.guild.id);
     if (s) {
       killProc(s.proc);
-      s.conn.destroy();
+      try { s.conn.destroy(); } catch {}
       sessions.delete(message.guild.id);
       return message.channel.send('🛑 Остановлено.');
     }
@@ -279,13 +314,13 @@ client.on('messageCreate', async (message) => {
   }
 });
 
-// Обработка выбора из меню
+// Выбор из меню
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isStringSelectMenu()) return;
   if (interaction.customId !== 'radio_select') return;
 
   const url = interaction.values[0];
-  await interaction.deferReply({ ephemeral: false });
+  await interaction.deferReply({ flags: 0 }); // без deprecated ephemeral
   return playOnGuild(interaction, url);
 });
 
