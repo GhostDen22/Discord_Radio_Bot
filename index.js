@@ -26,18 +26,16 @@ const {
 const { spawn, spawnSync } = require('child_process');
 const ffmpegStatic = require('ffmpeg-static');
 
-// Автодетект: сначала пробуем системный ffmpeg, если его нет — берём ffmpeg-static.
+// Автодетект: сначала системный ffmpeg (если есть и если ты оставил FFMPEG_BIN=ffmpeg),
+// иначе падаем на ffmpeg-static из node_modules.
 function resolveFfmpegBin() {
   const wanted = process.env.FFMPEG_BIN || 'ffmpeg';
-  try {
-    const ok = spawnSync(wanted, ['-version'], { stdio: 'ignore' });
-    if (ok.status === 0) return wanted;
-  } catch {}
+  try { if (spawnSync(wanted, ['-version'], { stdio: 'ignore' }).status === 0) return wanted; } catch {}
   if (ffmpegStatic) return ffmpegStatic;
-  throw new Error('FFmpeg not available: neither system ffmpeg nor ffmpeg-static');
+  throw new Error('FFmpeg not available');
 }
-const FFMPEG_BIN = resolveFfmpegBin();
-console.log('🎬 Using FFmpeg:', FFMPEG_BIN);
+const ffmpegBin = resolveFfmpegBin();
+console.log('🎬 FFmpeg bin:', ffmpegBin);
 
 // ─────────────────────────────────────────────────────────
 // БАЗОВЫЕ ПРОВЕРКИ
