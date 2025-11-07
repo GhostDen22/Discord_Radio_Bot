@@ -22,19 +22,36 @@ const {
 } = require('@discordjs/voice');
 
 const { spawn, spawnSync } = require('child_process');
-const ffmpegStatic = require('ffmpeg-static');
 
-// ---- FFmpeg autodetect (system first, fallback to ffmpeg-static)
+// 1) сначала системный ffmpeg, если он есть;
+// 2) затем @ffmpeg-installer/ffmpeg;
+// 3) затем ffmpeg-static.
 function resolveFfmpegBin() {
-  const wanted = process.env.FFMPEG_BIN || 'ffmpeg'; // env var or system
+  const tryBin = (bin) => {
+    try {
+      const r = spawnSync(bin, ['-version'], { stdio: 'ignore' });
+      return r.status === 0;
+    } catch { return false; }
+  };
+
+  const wanted = process.env.FFMPEG_BIN || 'ffmpeg';
+  if (tryBin(wanted)) return wanted;
+
   try {
-    const r = spawnSync(wanted, ['-version'], { stdio: 'ignore' });
-    if (r.status === 0) return wanted;
+    const inst = require('@ffmpeg-installer/ffmpeg');
+    if (inst?.path && tryBin(inst.path)) return inst.path;
   } catch {}
-  if (ffmpegStatic) return ffmpegStatic;
-  throw new Error('FFmpeg not available (no system ffmpeg and no ffmpeg-static)');
+
+  try {
+    const staticPath = require('ffmpeg-static');
+    if (staticPath && tryBin(staticPath)) return staticPath;
+  } catch {}
+
+  throw new Error('FFmpeg binary not available');
 }
+
 const ffmpegBin = resolveFfmpegBin();
+console.log('🎬 FFmpeg bin:', ffmpegBin);
 
 // ---- sanity
 if (!process.env.DISCORD_TOKEN) {
