@@ -20,10 +20,13 @@ const {
   entersState,
   StreamType,
   generateDependencyReport,
+  demuxProbe,
 } = require('@discordjs/voice');
 
 const { spawn } = require('child_process');
-const ffmpeg = require('ffmpeg-static');
+const ffmpegStatic = require('ffmpeg-static');
+// системный ffmpeg, если задан FFMPEG_BIN=ffmpeg (Railway), иначе — ffmpeg-static
+const ffmpegBin = process.env.FFMPEG_BIN || ffmpegStatic;
 
 // ─────────────────────────────────────────────────────────
 // БАЗОВЫЕ ПРОВЕРКИ
@@ -34,7 +37,7 @@ if (!process.env.DISCORD_TOKEN) {
 }
 
 console.log('🧩 Voice deps report:\n' + generateDependencyReport());
-console.log('🎬 FFmpeg path:', ffmpeg);
+console.log('🎬 FFmpeg bin:', ffmpegBin || '(not found)');
 
 // ─────────────────────────────────────────────────────────
 // КАТАЛОГ СТАНЦИЙ
@@ -42,14 +45,14 @@ console.log('🎬 FFmpeg path:', ffmpeg);
 const STATIONS = [
   { label: 'Radio R', desc: 'Литва', value: 'https://stream1.relaxfm.lt/rrb128.mp3', emoji: '📻' },
   { label: 'Авторадио (Мск)', desc: 'HLS', value: 'https://hls-01-gpm.hostingradio.ru/avtoradio495/playlist.m3u8', emoji: '🚗' },
-  { label: 'Ретро FM (Мск)', desc: 'MP3', value: 'http://emgregion.hostingradio.ru:8064/moscow.retrofm.mp3', emoji: '🕰️' },
+  { label: 'Ретро FM (Мск)',  desc: 'MP3', value: 'http://emgregion.hostingradio.ru:8064/moscow.retrofm.mp3', emoji: '🕰️' },
 ];
 
 const customStations = []; // временные станции на время работы
 const sessions = new Map(); // guildId -> {conn, player, proc, url, retry}
 
 // ─────────────────────────────────────────────────────────
-// FFmpeg c авто-переподключением/IPv4/заголовками
+// FFmpeg с авто-переподключением и нужными заголовками
 // ─────────────────────────────────────────────────────────
 function makeFfmpeg(url) {
   const headers =
@@ -58,43 +61,46 @@ function makeFfmpeg(url) {
     'Origin: https://discordapp.com\r\n' +
     'Referer: https://discordapp.com/\r\n';
 
-  // Если это HLS (.m3u8), дадим whitelist с tls; для mp3/aac он не нужен.
   const isHls = /\.m3u8(\?|$)/i.test(url);
 
   const args = [
     '-hide_banner',
 
-    // Сетевые флаги / переподключения
+    // переподключения
     '-reconnect', '1',
     '-reconnect_streamed', '1',
     '-reconnect_delay_max', '10',
-    '-rw_timeout', '15000000',   // 15s на операции ввода-вывода
+    '-rw_timeout', '15000000',
 
-    // Заголовки и «маскировка» под обычный плеер
+    // заголовки
     '-headers', headers,
 
-    // Анализ потока — даём чуть больше, чтобы HLS не отваливался сразу
+    // анализ/лог
     '-nostdin',
     '-loglevel', 'warning',
-    '-analyzeduration', '2000000', // ~2s
+    '-analyzeduration', '2000000',
     '-probesize', '256k',
 
-    // Вход
+    // вход
     ...(isHls ? ['-protocol_whitelist', 'file,crypto,tcp,http,https,tls'] : []),
     '-i', url,
 
+    // устойчивость
     '-fflags', '+genpts+discardcorrupt',
     '-vn',
 
-    // Вывод в сыром PCM (Discord сам кодирует в Opus)
-    '-acodec', 'pcm_s16le',
-    '-f', 's16le',
-    '-ar', '48000',
-    '-ac', '2',
+    // ВЫВОД: Ogg/Opus (готово для Discord без доп. энкодера)
+    '-c:a', 'libopus',
+    '-b:a', '128k',
+    '-frame_duration', '60',
+    '-application', 'audio',
+    '-f', 'ogg',
     'pipe:1',
   ];
 
-  const proc = spawn(ffmpeg, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  if (!ffmpegBin) throw new Error('FFmpeg binary not found');
+
+  const proc = spawn(ffmpegBin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
   proc.stderr.on('data', (b) => {
     const s = b.toString();
@@ -103,7 +109,10 @@ function makeFfmpeg(url) {
     }
   });
 
+  proc.stdout.on('error', (e) => console.error('ffmpeg stdout error:', e));
+  proc.on('error', (e) => console.error('ffmpeg spawn error:', e));
   proc.on('close', (code, sig) => console.warn(`ffmpeg closed: code=${code} sig=${sig || ''}`));
+
   return proc;
 }
 
@@ -130,7 +139,7 @@ async function playOnGuild(messageOrInteraction, url) {
       guildId: guild.id,
       adapterCreator: guild.voiceAdapterCreator,
       selfDeaf: true,
-      // Если вдруг будут проблемы с DAVE, можно отключить:
+      // daveEncryption можно отключить через переменную, если вдруг мешает:
       // daveEncryption: process.env.DISABLE_DAVE === 'true' ? false : undefined,
     });
 
@@ -159,8 +168,7 @@ async function playOnGuild(messageOrInteraction, url) {
 
     player.on('stateChange', (o, n) => {
       console.log(`🎧 Player: ${o.status} -> ${n.status}`);
-      // если пошло Playing — сбрасываем счётчик перезапусков
-      if (n.status === AudioPlayerStatus.Playing) s.retry = 0;
+      if (n.status === AudioPlayerStatus.Playing) s.retry = 0; // стабилизировалось — обнулим счётчик
     });
 
     // Автоперезапуск при обрыве с экспоненциальной паузой
@@ -170,7 +178,7 @@ async function playOnGuild(messageOrInteraction, url) {
         console.warn('⛔ Слишком много перезапусков, остановка.');
         return;
       }
-      const delay = Math.min(1000 * (2 ** s.retry), 15_000); // до 15с
+      const delay = Math.min(1000 * (2 ** s.retry), 15_000);
       console.warn(`🔁 Поток оборвался. Перезапуск #${s.retry + 1} через ${delay}мс...`);
       setTimeout(() => startFfmpegIntoPlayer(s, s.url), delay);
       s.retry++;
@@ -205,7 +213,17 @@ function startFfmpegIntoPlayer(session, url) {
   killProc(session.proc);
   const proc = makeFfmpeg(url);
   session.proc = proc;
-  const resource = createAudioResource(proc.stdout, { inputType: StreamType.Raw, inlineVolume: true });
+
+  const resource = createAudioResource(proc.stdout, {
+    inputType: StreamType.OggOpus,
+    inlineVolume: true,
+  });
+
+  resource.playStream.on('error', (e) => {
+    console.error('resource playStream error:', e);
+    killProc(proc);
+  });
+
   session.player?.play(resource);
 }
 
@@ -252,9 +270,6 @@ const client = new Client({
   ],
 });
 
-// NB: warning про ready → clientReady (не критично), можно оставить как есть.
-// Для тишины логов можно так:
-// client.once('clientReady', ...) — но оставлю твой стиль:
 client.once('ready', () => {
   console.log(`✅ Запущен как ${client.user.tag}`);
   console.log('Команды: !play <url|name>, !stations, !add "<name>" <url>, !list, !stop');
