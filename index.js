@@ -2,128 +2,88 @@
 require('dotenv').config();
 
 const {
-  Client,
-  GatewayIntentBits,
-  EmbedBuilder,
-  ActionRowBuilder,
-  StringSelectMenuBuilder,
+  Client, GatewayIntentBits,
+  EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder,
 } = require('discord.js');
 
 const {
-  joinVoiceChannel,
-  createAudioPlayer,
-  createAudioResource,
-  AudioPlayerStatus,
-  VoiceConnectionStatus,
-  NoSubscriberBehavior,
-  entersState,
-  StreamType,
+  joinVoiceChannel, createAudioPlayer, createAudioResource, getVoiceConnection,
+  AudioPlayerStatus, VoiceConnectionStatus, entersState, StreamType,
   generateDependencyReport,
 } = require('@discordjs/voice');
 
-const { spawn, spawnSync } = require('child_process');
+const { spawn } = require('child_process');
+const ffmpeg = require('ffmpeg-static');
 
-// 1) сначала системный ffmpeg, если он есть;
-// 2) затем @ffmpeg-installer/ffmpeg;
-// 3) затем ffmpeg-static.
-function resolveFfmpegBin() {
-  const tryBin = (bin) => {
-    try {
-      const r = spawnSync(bin, ['-version'], { stdio: 'ignore' });
-      return r.status === 0;
-    } catch { return false; }
-  };
-
-  const wanted = process.env.FFMPEG_BIN || 'ffmpeg';
-  if (tryBin(wanted)) return wanted;
-
-  try {
-    const inst = require('@ffmpeg-installer/ffmpeg');
-    if (inst?.path && tryBin(inst.path)) return inst.path;
-  } catch {}
-
-  try {
-    const staticPath = require('ffmpeg-static');
-    if (staticPath && tryBin(staticPath)) return staticPath;
-  } catch {}
-
-  throw new Error('FFmpeg binary not available');
-}
-
-const ffmpegBin = resolveFfmpegBin();
-console.log('🎬 FFmpeg bin:', ffmpegBin);
-
-// ---- sanity
+// ─────────────────────────────────────────────────────────
+// БАЗОВЫЕ ПРОВЕРКИ
+// ─────────────────────────────────────────────────────────
 if (!process.env.DISCORD_TOKEN) {
   console.error('❌ Нет DISCORD_TOKEN в .env');
   process.exit(1);
 }
 
 console.log('🧩 Voice deps report:\n' + generateDependencyReport());
-console.log('🎬 FFmpeg bin:', ffmpegBin);
+console.log('🎬 FFmpeg path:', ffmpeg);
 
-// ---- stations
+// ─────────────────────────────────────────────────────────
+// КАТАЛОГ СТАНЦИЙ (можешь смело редактировать/добавлять)
+// value = прямой URL потока
+// ─────────────────────────────────────────────────────────
 const STATIONS = [
   { label: 'Radio R', desc: 'Литва', value: 'https://stream1.relaxfm.lt/rrb128.mp3', emoji: '📻' },
-  { label: 'Авторадио (Мск)', desc: 'HLS', value: 'https://hls-01-gpm.hostingradio.ru/avtoradio495/playlist.m3u8', emoji: '🚗' },
-  { label: 'Ретро FM (Мск)',  desc: 'MP3', value: 'http://emgregion.hostingradio.ru:8064/moscow.retrofm.mp3', emoji: '🕰️' },
+  { label: 'Авторадио (Мск)', desc: 'HLS',   value: 'https://hls-01-gpm.hostingradio.ru/avtoradio495/playlist.m3u8', emoji: '🚗' },
+  { label: 'Ретро FM (Мск)',  desc: 'MP3',   value: 'http://emgregion.hostingradio.ru:8064/moscow.retrofm.mp3', emoji: '🕰️' },
 ];
 
-const customStations = [];
+// Хранилище на время жизни процесса (динамически добавленные станции)
+const customStations = []; // {label, desc, value, emoji?}
+
+// Управление по серверам: соединение/плеер/процесс ffmpeg
 const sessions = new Map(); // guildId -> {conn, player, proc, url, retry}
 
-// ---- FFmpeg pipeline: input -> Ogg/Opus (ready for Discord)
+// ─────────────────────────────────────────────────────────
+// FFmpeg (поддерживает m3u8/mp3/aac) + заголовки
+// ─────────────────────────────────────────────────────────
 function makeFfmpeg(url) {
   const headers =
-    'User-Agent: Winamp/5.09\r\n' +
-    'Icy-MetaData: 1\r\n' +
-    'Origin: https://discordapp.com\r\n' +
-    'Referer: https://discordapp.com/\r\n';
-
-  const isHls = /\.m3u8(\?|$)/i.test(url);
+    'User-Agent: Mozilla/5.0 (DiscordRadioBot)\r\n' +
+    'Referer: https://radior.lt/online/\r\n' +
+    'Origin: https://radior.lt\r\n';
 
   const args = [
     '-hide_banner',
-    // reconnects
     '-reconnect', '1',
     '-reconnect_streamed', '1',
-    '-reconnect_delay_max', '10',
-    '-rw_timeout', '15000000',
-    // headers
+    '-reconnect_delay_max', '5',
+    '-rw_timeout', '10000000',
     '-headers', headers,
-    // probing
-    '-nostdin',
-    '-loglevel', 'warning',
-    '-analyzeduration', '2000000',
-    '-probesize', '256k',
-    // input
-    ...(isHls ? ['-protocol_whitelist', 'file,crypto,tcp,http,https,tls'] : []),
     '-i', url,
-    // robustness
     '-fflags', '+genpts+discardcorrupt',
     '-vn',
-    // OUTPUT: Ogg/Opus (Discord-friendly)
-    '-c:a', 'libopus',
-    '-b:a', '128k',
-    '-frame_duration', '60',
-    '-application', 'audio',
-    '-f', 'ogg',
+    '-acodec', 'pcm_s16le',
+    '-f', 's16le',
+    '-ar', '48000',
+    '-ac', '2',
     'pipe:1',
   ];
 
-  const proc = spawn(ffmpegBin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-  proc.stderr.on('data', b => {
+  const proc = spawn(ffmpeg, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+  proc.stderr.on('data', (b) => {
     const s = b.toString();
     if (/error|invalid|fail|timeout|403|404|denied|not found/i.test(s)) {
-      console.warn('ffmpeg:', s.trim());
+      console.error('ffmpeg:', s.trim());
     }
   });
-  proc.on('error', e => console.error('ffmpeg spawn error:', e));
-  proc.on('close', (code, sig) => console.warn(`ffmpeg closed: code=${code} sig=${sig || ''}`));
+
+  proc.on('close', (code) => console.warn('ffmpeg exited with code', code));
   return proc;
 }
 
-// ---- play/restart
+// ─────────────────────────────────────────────────────────
+// Запуск/перезапуск потока
+// ─────────────────────────────────────────────────────────
 async function playOnGuild(messageOrInteraction, url) {
   const guild = messageOrInteraction.guild;
   const member = messageOrInteraction.member;
@@ -135,6 +95,7 @@ async function playOnGuild(messageOrInteraction, url) {
     return messageOrInteraction.followUp(reply);
   }
 
+  // Получаем/создаём сессию
   let s = sessions.get(guild.id);
   if (!s) {
     const conn = joinVoiceChannel({
@@ -142,13 +103,12 @@ async function playOnGuild(messageOrInteraction, url) {
       guildId: guild.id,
       adapterCreator: guild.voiceAdapterCreator,
       selfDeaf: true,
-      // daveEncryption: false, // если помешает DAVE, раскомментируй
+      // daveEncryption: false, // если нет @snazzah/davey и вылезает ошибка — временно раскомментируй
     });
 
-    const player = createAudioPlayer({
-      behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
-    });
+    const player = createAudioPlayer();
 
+    // Автовосстановление голосового соединения
     conn.on(VoiceConnectionStatus.Disconnected, async () => {
       console.warn('⚠️ Voice disconnected, trying to reconnect...');
       try {
@@ -158,7 +118,7 @@ async function playOnGuild(messageOrInteraction, url) {
         ]);
         console.log('🔄 Voice reconnected');
       } catch {
-        try { conn.destroy(); } catch {}
+        conn.destroy();
         sessions.delete(guild.id);
       }
     });
@@ -168,17 +128,16 @@ async function playOnGuild(messageOrInteraction, url) {
     sessions.set(guild.id, s);
 
     player.on('stateChange', (o, n) => {
-      console.log(`🎧 Player: ${o.status} -> ${n.status}`);
-      if (n.status === AudioPlayerStatus.Playing) s.retry = 0;
+      console.log(`🔁 Player: ${o.status} -> ${n.status}`);
     });
 
+    // Автоперезапуск при обрыве
     player.on(AudioPlayerStatus.Idle, () => {
       if (!s.url) return;
-      if (s.retry >= 10) return console.warn('⛔ Слишком много перезапусков, остановка.');
-      const delay = Math.min(1000 * (2 ** s.retry), 15000);
-      console.warn(`🔁 Поток оборвался. Перезапуск #${s.retry + 1} через ${delay}мс...`);
-      setTimeout(() => startFfmpegIntoPlayer(s, s.url), delay);
+      if (s.retry >= 5) return; // ограничим циклы
       s.retry++;
+      console.warn(`🔁 Поток оборвался. Перезапуск #${s.retry}...`);
+      startFfmpegIntoPlayer(s, s.url);
     });
 
     player.on('error', (err) => {
@@ -189,33 +148,20 @@ async function playOnGuild(messageOrInteraction, url) {
 
   s.retry = 0;
   s.url = url;
-  await entersState(s.conn, VoiceConnectionStatus.Ready, 15000);
+  await entersState(s.conn, VoiceConnectionStatus.Ready, 15_000);
   console.log('🎧 Voice ready');
 
-  try {
-    startFfmpegIntoPlayer(s, url);
-    const text = `📻 Играет: ${url}`;
-    if ('reply' in messageOrInteraction) {
-      if (messageOrInteraction.deferred || messageOrInteraction.replied) {
-        await messageOrInteraction.followUp(text);
-      } else {
-        await messageOrInteraction.reply(text);
-      }
+  startFfmpegIntoPlayer(s, url);
+
+  const text = `📻 Играет: ${url}`;
+  if ('reply' in messageOrInteraction) {
+    if (messageOrInteraction.deferred || messageOrInteraction.replied) {
+      await messageOrInteraction.followUp(text);
     } else {
-      await messageOrInteraction.channel.send(text);
+      await messageOrInteraction.reply(text);
     }
-  } catch (e) {
-    console.error('playOnGuild error:', e);
-    const msg = '❌ Не удалось запустить поток.';
-    if ('reply' in messageOrInteraction) {
-      if (messageOrInteraction.deferred || messageOrInteraction.replied) {
-        await messageOrInteraction.followUp(msg);
-      } else {
-        await messageOrInteraction.reply(msg);
-      }
-    } else {
-      await messageOrInteraction.channel.send(msg);
-    }
+  } else {
+    await messageOrInteraction.channel.send(text);
   }
 }
 
@@ -223,18 +169,8 @@ function startFfmpegIntoPlayer(session, url) {
   killProc(session.proc);
   const proc = makeFfmpeg(url);
   session.proc = proc;
-
-  const resource = createAudioResource(proc.stdout, {
-    inputType: StreamType.OggOpus,
-    inlineVolume: true,
-  });
-
-  resource.playStream.on('error', (e) => {
-    console.error('resource playStream error:', e);
-    killProc(proc);
-  });
-
-  session.player.play(resource);
+  const resource = createAudioResource(proc.stdout, { inputType: StreamType.Raw });
+  session.player?.play(resource);
 }
 
 function killProc(proc) {
@@ -242,13 +178,14 @@ function killProc(proc) {
   try { proc.kill('SIGKILL'); } catch {}
 }
 
-// ---- UI
+// ─────────────────────────────────────────────────────────
+// UI: Выпадающее меню станций
+// ─────────────────────────────────────────────────────────
 async function sendStationsMenu(channel) {
+  // максимум 25 опций в одном меню
   const options = [...STATIONS, ...customStations].slice(0, 25).map(s => ({
-    label: s.label,
-    description: s.desc?.slice(0, 50) || 'Радио',
-    value: s.value,
-    emoji: s.emoji || '🎵',
+    label: s.label, description: s.desc?.slice(0, 50) || 'Радио',
+    value: s.value, emoji: s.emoji || '🎵',
   }));
 
   const embed = new EmbedBuilder()
@@ -262,10 +199,13 @@ async function sendStationsMenu(channel) {
     .addOptions(options);
 
   const row = new ActionRowBuilder().addComponents(menu);
+
   await channel.send({ embeds: [embed], components: [row] });
 }
 
-// ---- Discord client
+// ─────────────────────────────────────────────────────────
+// DISCORD CLIENT
+// ─────────────────────────────────────────────────────────
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -280,16 +220,18 @@ client.once('ready', () => {
   console.log('Команды: !play <url|name>, !stations, !add "<name>" <url>, !list, !stop');
 });
 
+// Сообщения-команды
 client.on('messageCreate', async (message) => {
   if (!message.guild || message.author.bot) return;
 
   const text = message.content.trim();
   const [cmd, ...rest] = text.split(/\s+/);
-
+  // !help
   if (cmd === '!help') {
-    return message.channel.send('Команды: !play <url|name>, !stations, !add "<name>" <url>, !list, !stop');
+      return message.channel.send('Команды: !play <url|name>, !stations, !add "<name>" <url>, !list, !stop');
   }
 
+  // !play <url|name>
   if (cmd === '!play') {
     const arg = rest.join(' ').trim();
     if (!arg) return message.reply('Использование: `!play <url|имя_станции>`');
@@ -302,26 +244,34 @@ client.on('messageCreate', async (message) => {
     return playOnGuild(message, url);
   }
 
-  if (cmd === '!stations') return sendStationsMenu(message.channel);
+  // !stations — показать меню
+  if (cmd === '!stations') {
+    return sendStationsMenu(message.channel);
+  }
 
+  // !add "<name>" <url> — добавить свою станцию на время работы бота
   if (cmd === '!add') {
     const m = text.match(/^!add\s+"([^"]+)"\s+(\S+)/);
-    if (!m) return message.reply('Использование: `!add "Название станции" <url>`');
+    if (!m) {
+      return message.reply('Использование: `!add "Название станции" <url>`');
+    }
     const [, label, url] = m;
     customStations.unshift({ label, desc: 'Пользовательская станция', value: url, emoji: '⭐' });
     return message.reply(`✅ Добавил в список: **${label}** → ${url}`);
   }
 
+  // !list — вывести список имён, чтобы потом было удобно !play <name>
   if (cmd === '!list') {
     const lines = [...STATIONS, ...customStations].map(s => `• **${s.label}** — ${s.value}`);
     return message.reply(lines.join('\n').slice(0, 1900));
   }
 
+  // !stop — остановить и выйти
   if (cmd === '!stop') {
     const s = sessions.get(message.guild.id);
     if (s) {
       killProc(s.proc);
-      try { s.conn.destroy(); } catch {}
+      s.conn.destroy();
       sessions.delete(message.guild.id);
       return message.channel.send('🛑 Остановлено.');
     }
@@ -329,20 +279,15 @@ client.on('messageCreate', async (message) => {
   }
 });
 
+// Обработка выбора из меню
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isStringSelectMenu()) return;
   if (interaction.customId !== 'radio_select') return;
 
   const url = interaction.values[0];
-  try {
-    await interaction.deferReply({ flags: 0 });
-    await playOnGuild(interaction, url);
-  } catch (e) {
-    console.error('interaction error:', e);
-    if (!interaction.replied) {
-      await interaction.reply('❌ Не удалось запустить поток.');
-    }
-  }
+  await interaction.deferReply({ ephemeral: false });
+  return playOnGuild(interaction, url);
 });
 
+// ─────────────────────────────────────────────────────────
 client.login(process.env.DISCORD_TOKEN).catch(e => console.error('❌ Ошибка входа:', e));
