@@ -1,0 +1,20 @@
+# База: Debian + Node LTS (можно 20, если у тебя 22 ломает что-то)
+FROM node:20-bullseye
+
+# Ставим ffmpeg из репозитория Debian
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ffmpeg \
+  && rm -rf /var/lib/apt/lists/*
+
+# Рабочая папка
+WORKDIR /app
+
+# Сначала зависимости (лучше с lock-файлом)
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+# Копируем код
+COPY . .
+
+# Запуск
+CMD ["node", "index.js"]
