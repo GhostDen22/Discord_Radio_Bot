@@ -260,6 +260,7 @@ async function playOnGuild(ctx, url) {
       guildId: guild.id,
       adapterCreator: guild.voiceAdapterCreator,
       selfDeaf: true,
+      daveEncryption: false, 
     });
 
     const player = createAudioPlayer();
