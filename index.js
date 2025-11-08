@@ -49,42 +49,64 @@ function headersFor(url) {
     referer = `${origin}/`;
     host = u.host;
   } catch {}
-  // спец-кейс: GPM/hostingradio
+
+  // GPM/hostingradio требуют реферер сайта станции
   if (/hostingradio\.ru$/i.test(host)) {
     origin  = 'https://www.avtoradio.ru';
     referer = 'https://www.avtoradio.ru/online/';
   }
-  return 'User-Agent: Mozilla/5.0 (DiscordRadioBot)\r\n'
-       + `Origin: ${origin}\r\n`
-       + `Referer: ${referer}\r\n`
-       + 'Accept: */*\r\n';
+
+  return (
+    'Accept: */*\r\n' +
+    `Origin: ${origin}\r\n` +
+    `Referer: ${referer}\r\n`
+  );
 }
 
+
 // ---- FFmpeg конвейер
-function spawnFfmpeg(url, mode, useAdvancedHlsFlags) {
+function spawnFfmpeg(url, mode) {
   const isHls = /\.m3u8(\?|$)/i.test(url);
+
   const args = [
     '-hide_banner','-nostdin','-loglevel','warning',
+    '-user_agent','Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+    '-headers', headersFor(url),
+
+    // стабильность соединения
     '-reconnect','1','-reconnect_streamed','1','-reconnect_at_eof','1',
     '-reconnect_delay_max','5',
     '-rw_timeout','15000000',
-    '-analyzeduration','2000000','-probesize','256k',
-    '-headers', headersFor(url),
-  ];
-  if (isHls) {
-    args.push('-protocol_whitelist','file,crypto,tcp,http,https,tls');
-    args.push('-ignore_io_errors','1');
-    if (useAdvancedHlsFlags) args.push('-playlist_flags','+live+append_list+ignore_length+omit_endlist');
-  }
-  args.push('-i', url, '-fflags', '+genpts+discardcorrupt', '-vn','-sn','-dn');
 
+    // быстрее стартуем и меньше буферим
+    '-analyzeduration','0','-probesize','64k',
+  ];
+
+  if (isHls) {
+    args.push(
+      // разрешаем нужные протоколы
+      '-protocol_whitelist','file,crypto,tcp,http,https,tls',
+      // HLS — живой, не искать seek
+      '-seekable','0'
+      // никаких playlist_flags / ignore_io_errors — они и ругались/ломались
+    );
+  }
+
+  // вход
+  args.push('-i', url,
+            '-fflags', '+genpts+discardcorrupt',
+            '-vn','-sn','-dn');
+
+  // выход
   if (mode === 'opus') {
     args.push('-c:a','libopus','-b:a','128k','-vbr','on','-compression_level','10','-f','ogg','pipe:1');
   } else {
     args.push('-acodec','pcm_s16le','-f','s16le','-ar','48000','-ac','2','pipe:1');
   }
+
   return spawn(ffmpegBin, args, { stdio: ['ignore','pipe','pipe'] });
 }
+
 
 function makeFfmpeg(url, mode, attempt=1){
   const isHls = /\.m3u8(\?|$)/i.test(url);
